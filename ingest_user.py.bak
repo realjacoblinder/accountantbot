@@ -1,0 +1,53 @@
+# ingest_user.py
+import shutil
+from pathlib import Path
+from langchain_community.document_loaders import PyPDFLoader, TextLoader
+from embedding_chunks import chunk_documents
+from llm_client import create_embeddings
+from langchain_chroma import Chroma
+
+USER_DIR = "./data/user"
+USER_STORE = "./chroma_user_docs"
+
+def load_user_docs():
+    docs = []
+    for p in Path(USER_DIR).rglob("*"):
+        if p.suffix == ".pdf":
+            loader_docs = PyPDFLoader(str(p)).load()
+        elif p.suffix in {".txt", ".md"}:
+            loader_docs = TextLoader(str(p), autodetect_encoding=True).load()
+        else:
+            continue
+        # Tag each doc with its filename for traceability in answers
+        for doc in loader_docs:
+            doc.metadata["filename"] = p.name
+        docs.extend(loader_docs)
+    return docs
+
+def ingest(clear_existing=True):
+    # Wipe old user store to prevent stale document contamination
+    if clear_existing and Path(USER_STORE).exists():
+        shutil.rmtree(USER_STORE)
+        print("  → Cleared previous user store")
+
+    print("Loading user documents...")
+    raw_docs = load_user_docs()
+    print(f"  → Loaded {len(raw_docs)} pages from {USER_DIR}")
+
+    chunks = chunk_documents(raw_docs)
+    print(f"  → Split into {len(chunks)} chunks")
+
+    for chunk in chunks:
+        chunk.metadata["source_type"] = "user"
+
+    embeddings = create_embeddings(purpose="ingestion")
+    Chroma.from_documents(
+        documents=chunks,
+        embedding=embeddings,
+        collection_name="user_docs",
+        persist_directory=USER_STORE
+    )
+    print(f"✓ User store built at {USER_STORE}")
+
+if __name__ == "__main__":
+    ingest()
