@@ -37,21 +37,14 @@ For CPU-only use, omit `-DGGML_CUDA=ON`. Follow the llama.cpp build instructions
 
 Place the model GGUFs and their matching projectors under `~/model-gguf/`, or edit the paths in the INI files. The configured aliases are:
 
-| Alias | Purpose | Configuration |
-| --- | --- | --- |
-| `gemma-4-26B-A4B` | Chat, agent queries, and multimodal answer context | GPU `models.ini` |
-| `gemma-4-E4B` | PDF page triage and transcription | GPU `models.ini` |
-| `embeddinggemma-2-gpu` | Index building, tokenizer calls, and page-image embeddings | GPU `models.ini` |
-| `embeddinggemma-2-F16` | Query embeddings | CPU `cpu-models.ini` |
+| Alias | Purpose | Configuration | Model |
+| --- | --- | --- | --- |
+| `gemma-4-26B-A4B` | Chat, agent queries, and multimodal answer context | GPU `models.ini` | [Gemma 4 26B A4B IT QAT](https://huggingface.co/unsloth/gemma-4-26B-A4B-it-qat-GGUF) |
+| `gemma-4-E4B` | PDF page triage and transcription | GPU `models.ini` | [Gemma 4 E4B IT QAT](https://huggingface.co/unsloth/gemma-4-E4B-it-qat-GGUF) (Q4) |
+| `embeddinggemma-2-gpu` | Index building, tokenizer calls, and page-image embeddings | GPU `models.ini` | [EmbeddingGemma 2](https://huggingface.co/unsloth/embeddinggemma-2-GGUF) (FP16) |
+| `embeddinggemma-2-F16` | Query embeddings | CPU `cpu-models.ini` | Same EmbeddingGemma 2 weights and projector (FP16) |
 
 The two EmbeddingGemma aliases point to the same weights and projector and use mean pooling with normalized output, so query vectors are compatible with indexed vectors. The GPU alias supports image embedding and uses four parallel slots; the CPU alias is intended for a separate query endpoint. The Gemma aliases use their matching multimodal projectors. The shared GPU defaults enable Jinja templates, flash attention, quantized KV cache, and idle unloading; the CPU defaults disable GPU offload.
-
-Models used: 
-EmbeddingGemma2 - https://huggingface.co/unsloth/embeddinggemma-2-GGUF/tree/main
- - Used FP16
-Gemma4-26B - https://huggingface.co/unsloth/gemma-4-26B-A4B-it-qat-GGUF/tree/main
-Gemma4-E4B - https://huggingface.co/unsloth/gemma-4-E4B-it-qat-GGUF
- - Used Q4
 
 ### Install the user service
 
