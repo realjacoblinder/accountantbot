@@ -46,6 +46,13 @@ Place the model GGUFs and their matching projectors under `~/model-gguf/`, or ed
 
 The two EmbeddingGemma aliases point to the same weights and projector and use mean pooling with normalized output, so query vectors are compatible with indexed vectors. The GPU alias supports image embedding and uses four parallel slots; the CPU alias is intended for a separate query endpoint. The Gemma aliases use their matching multimodal projectors. The shared GPU defaults enable Jinja templates, flash attention, quantized KV cache, and idle unloading; the CPU defaults disable GPU offload.
 
+Models used: 
+EmbeddingGemma2 - https://huggingface.co/unsloth/embeddinggemma-2-GGUF/tree/main
+ - Used FP16
+Gemma4-26B - https://huggingface.co/unsloth/gemma-4-26B-A4B-it-qat-GGUF/tree/main
+Gemma4-E4B - https://huggingface.co/unsloth/gemma-4-E4B-it-qat-GGUF
+ - Used Q4
+
 ### Install the user service
 
 The provided `llama-server.service` runs the multi-model server on `127.0.0.1:8080`, using the GPU presets in `models.ini`. Install it as a systemd **user** unit:
