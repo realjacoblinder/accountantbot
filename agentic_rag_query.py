@@ -1,5 +1,8 @@
 # agentic_rag_query.py
 from pathlib import Path
+import argparse
+from agent_diagnostics import LOGGER, TracedRetriever, configure_logging, endpoint_name
+from query_prompts import AGENT_SYSTEM_PROMPT, RETRIEVED_IMAGE_PROMPT, FINAL_ANSWER_PROMPT
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_core.tools import tool
@@ -8,113 +11,14 @@ from langchain_community.retrievers import BM25Retriever
 from typing import List
 
 from custom_langchain import HybridEnsembleRetriever, DualStoreRetriever
-from llm_client import create_chat_model, create_embeddings
+from llm_client import create_chat_model, create_embeddings, load_llm_config
 from retrieval_content import keyword_documents, retrieval_content, source_text
 
 BACKGROUND_STORE = "./chroma_tax_code"
 USER_STORE = "./chroma_user_docs"
 MAX_ITERATIONS = 5
 
-# SYSTEM_PROMPT = """You are a tax assistant with access to two retrieval tools:
-# ... (rest of SYSTEM_PROMPT)
-
-# - `search_tax_code`: searches the US tax code for laws, rules, and definitions
-# - `search_user_docs`: searches the user's personal tax documents (W-2s, 1099s, etc.)
-
-# Instructions:
-# 1. Always search user documents first to ground your answer in their specific situation.
-# 2. Use the tax code tool to find relevant laws, brackets, or deduction rules.
-# 3. You may call tools multiple times if the first result is insufficient — for example,
-#    if an answer references another code section, look that up too.
-# 4. Only answer once you have enough context from the documents.
-# 5. Cite the specific USC section (e.g. "26 U.S.C. § 1(a)") for every rule you apply.
-# 6. Never fabricate figures or rules not found in the retrieved context."""
-SYSTEM_PROMPT = """You are an expert US tax assistant with access to two retrieval tools:
-
-- `search_tax_code`: searches the full US tax code (Title 26 USC) for laws, rules, brackets, and definitions
-- `search_user_docs`: searches the user's personal tax documents such as W-2s, 1099s, brokerage statements, and receipts
-
-## How to Answer
-
-1. **Always search user documents first.** Ground every answer in the user's actual figures before applying tax law.
-2. **Then search the tax code** to find the relevant statute, bracket, deduction rule, or definition.
-3. **Call tools multiple times** when needed — for example, if a deduction rule cross-references another section, look that up too before answering.
-4. **Only give a final answer once you have enough retrieved context.** If the documents don't contain a needed figure, say so clearly and explain what the user would need to provide.
-5. **Cite every rule** with its specific USC section (e.g. "26 U.S.C. § 1(a)", "26 U.S.C. § 162(a)", "26 U.S.C. § 199A").
-6. **Never fabricate numbers, brackets, or rules.** If the retrieved context doesn't contain the answer, say so rather than guessing.
-7. **Show your work** for any tax calculations — list each figure, the rule applied, and the arithmetic step by step.
-
-## What You Will See in User Documents
-
-User documents may include, but are not limited to, the following. Extract specific figures carefully:
-
-**W-2 (Wage and Tax Statement)**
-- Box 1: Wages, tips, other compensation (gross taxable wages)
-- Box 2: Federal income tax withheld
-- Box 3/4: Social Security wages and tax withheld
-- Box 5/6: Medicare wages and tax withheld
-- Box 12: Coded entries (e.g. 12a: D = 401k contributions, 12b: DD = employer health coverage cost)
-- Box 14: Other (state disability, union dues, employer-paid tuition)
-- Box 15–17: State wages and withholding
-
-**1099-NEC (Nonemployee Compensation)**
-- Box 1: Nonemployee compensation (self-employment income — subject to SE tax)
-
-**1099-INT (Interest Income)**
-- Box 1: Interest income
-- Box 4: Federal income tax withheld
-- Box 8: Tax-exempt interest (municipal bonds)
-
-**1099-DIV (Dividends)**
-- Box 1a: Total ordinary dividends
-- Box 1b: Qualified dividends (taxed at capital gains rates)
-- Box 2a: Total capital gain distributions
-- Box 5: Section 199A dividends (REIT/pass-through)
-
-**1099-B (Broker / Barter Exchange)**
-- Proceeds from sale of stocks, bonds, or crypto
-- Cost basis, acquisition date, sale date
-- Short-term vs. long-term classification
-- Wash sale loss disallowed amounts
-
-**1098 (Mortgage Interest)**
-- Box 1: Mortgage interest received (potentially deductible under 26 U.S.C. § 163(h))
-- Box 2: Outstanding mortgage principal
-- Box 5: Mortgage insurance premiums
-
-**Brokerage Year-End Statements**
-- Realized gains/losses summary (short-term and long-term)
-- Dividend and interest income totals
-- Cost basis method used (FIFO, specific lot, etc.)
-
-**SSA-1099 (Social Security Benefits)**
-- Box 5: Net Social Security benefits received
-- Up to 85% may be taxable depending on combined income (26 U.S.C. § 86)
-
-**Schedule K-1 (Partnership / S-Corp / Trust)**
-- Box 1: Ordinary business income/loss
-- Box 2: Net rental real estate income
-- Box 14: Self-employment earnings
-
-## Example Reasoning Pattern
-
-User asks: *"How much do I owe in federal income tax?"*
-
-1. Call `search_user_docs("W-2 wages federal income tax withheld")` → get Box 1 wages and Box 2 withholding
-2. Call `search_user_docs("1099 interest dividends capital gains")` → check for other income sources
-3. Call `search_tax_code("standard deduction 2024 married filing jointly")` → get the applicable deduction amount
-4. Call `search_tax_code("tax brackets married filing jointly")` → get the rate table (26 U.S.C. § 1(a))
-5. Compute: Adjusted Gross Income → subtract standard deduction → apply brackets → subtract withholding
-6. Present the calculation step by step with citations
-
-If at step 2 the user has a 1099-B with capital gains, also call `search_tax_code("capital gains tax rates")` before answering.
-
-## Tone and Format
-
-- Be precise and numerical — always state exact dollar figures from documents, never round silently
-- Flag anything that could trigger an audit or requires professional review
-- If a question requires information not present in the retrieved documents (e.g. filing status, number of dependents), ask the user for that specific detail before proceeding
-- For complex situations (AMT exposure, QBI deduction, passive activity rules), note that a CPA review is advisable"""
+SYSTEM_PROMPT = AGENT_SYSTEM_PROMPT
 
 
 def build_tools(background_store: Chroma, user_store: Chroma):
@@ -123,30 +27,36 @@ def build_tools(background_store: Chroma, user_store: Chroma):
     """
     
     # --- 1. Setup Hybrid for Background (Tax Code) ---
+    LOGGER.info("Loading tax-code records for BM25")
     bg_data = background_store.get()
     bg_docs = [
         Document(page_content=t, metadata=m) 
         for t, m in zip(bg_data['documents'], bg_data['metadatas'])
     ]
+    LOGGER.info("Building tax-code BM25 records=%d", len(bg_docs))
     bg_bm25 = BM25Retriever.from_documents(bg_docs)
     bg_bm25.k = 5
     
     hybrid_background = HybridEnsembleRetriever(
-        retrievers=[background_store.as_retriever(search_kwargs={"k": 5}), bg_bm25],
+        retrievers=[TracedRetriever(retriever=background_store.as_retriever(search_kwargs={"k": 5}), label="tax_code.vector"),
+                    TracedRetriever(retriever=bg_bm25, label="tax_code.bm25")],
         weights=[0.7, 0.3]
     )
 
     # --- 2. Setup Hybrid for User Docs ---
+    LOGGER.info("Loading user-document records for BM25")
     u_data = user_store.get()
     u_docs = [
         Document(page_content=t, metadata=m) 
         for t, m in zip(u_data['documents'], u_data['metadatas'])
     ]
+    LOGGER.info("Building user-document BM25 records=%d keyword_records=%d", len(u_docs), len(keyword_documents(u_docs)))
     u_bm25 = BM25Retriever.from_documents(keyword_documents(u_docs))
     u_bm25.k = 4
     
     hybrid_user = HybridEnsembleRetriever(
-        retrievers=[user_store.as_retriever(search_kwargs={"k": 4}), u_bm25],
+        retrievers=[TracedRetriever(retriever=user_store.as_retriever(search_kwargs={"k": 4}), label="user_docs.vector"),
+                    TracedRetriever(retriever=u_bm25, label="user_docs.bm25")],
         weights=[0.5, 0.5]
     )
 
@@ -158,13 +68,13 @@ def build_tools(background_store: Chroma, user_store: Chroma):
 
     @tool
     def search_tax_code(query: str) -> str:
-        """Search the US tax code for laws, rules, brackets, and definitions."""
+        """Retrieve ranked Title 26 excerpts; annual IRS guidance may be unavailable."""
         docs = hybrid_background.invoke(query)
         return format_docs(docs)
 
     @tool
     def search_user_docs(query: str) -> list:
-        """Search the user's personal tax documents such as W-2s, 1099s, and receipts."""
+        """Retrieve ranked personal-document excerpts and page images, not a complete inventory."""
         docs = hybrid_user.invoke(query)
         return retrieval_content(docs)
 
@@ -179,7 +89,13 @@ def build_agent():
     if not Path(USER_STORE).exists():
         raise FileNotFoundError(f"User store not found at '{USER_STORE}'. Run ingest_user.py first.")
 
+    config = load_llm_config()
+    LOGGER.info("Query model=%s endpoint=%s max_tokens=%d reasoning_effort=%s timeout=%ss",
+                config["model"], endpoint_name(config["api_base"]), config["max_tokens"],
+                config["reasoning_effort"], config["timeout"])
     embeddings = create_embeddings()
+    LOGGER.info("Query embeddings model=%s endpoint=%s", embeddings.settings["model"],
+                endpoint_name(embeddings.settings["api_base"]))
 
     background_store = Chroma(
         collection_name="tax_code",
@@ -201,7 +117,8 @@ def build_agent():
     return llm_tools, tool_map
 
 
-def run_query(llm_tools, tool_map: dict, question: str, verbose: bool = True) -> str:
+def run_query(llm_tools, tool_map: dict, question: str, verbose: bool = True, *,
+              trace_content=False, stream=True, heartbeat_seconds=10) -> str:
     """
     Agentic ReAct loop:
       1. LLM decides which tool(s) to call
@@ -209,23 +126,24 @@ def run_query(llm_tools, tool_map: dict, question: str, verbose: bool = True) ->
       3. LLM sees results and either calls more tools or gives a final answer
       4. Repeat until no more tool calls or MAX_ITERATIONS reached
     """
-    print(f"  Running query: '{question[:60]}...' " if len(question) > 60 else f"  Running query: '{question}'")
+    from agent_diagnostics import QueryTrace
+    trace = QueryTrace(enabled=verbose, trace_content=trace_content, stream=stream,
+                       heartbeat_seconds=heartbeat_seconds)
+    trace.info("query started question_chars=%d max_rounds=%d", len(question), MAX_ITERATIONS)
     messages = [
         SystemMessage(content=SYSTEM_PROMPT),
         HumanMessage(content=question)
     ]
 
     for iteration in range(MAX_ITERATIONS):
-        response = llm_tools.invoke(messages)
+        response = trace.model_call(llm_tools, messages, str(iteration + 1))
         messages.append(response)
 
         # If no tool calls, the LLM has produced its final answer
         if not response.tool_calls:
-            return response.content
+            return trace.finish(response.content)
 
-        # Execute every tool call the LLM requested this round
-        if verbose:
-            print(f"\n  [Round {iteration + 1}] LLM called {len(response.tool_calls)} tool(s):")
+        trace.info("round=%d executing %d tool calls", iteration + 1, len(response.tool_calls))
 
         page_images = []
         for tool_call in response.tool_calls:
@@ -233,10 +151,7 @@ def run_query(llm_tools, tool_map: dict, question: str, verbose: bool = True) ->
             tool_args  = tool_call["args"]
             tool_id    = tool_call["id"]
 
-            if verbose:
-                print(f"    → {tool_name}({tool_args.get('query', '')})")
-
-            result = tool_map[tool_name].invoke(tool_args)
+            result = trace.tool_call(tool_map, tool_call, str(iteration + 1))
 
             # Keep tool results textual and supply visual evidence in a human
             # message after all pending tool calls have their matching result.
@@ -254,39 +169,41 @@ def run_query(llm_tools, tool_map: dict, question: str, verbose: bool = True) ->
                 tool_call_id=tool_id
             ))
 
+        trace.info("round=%d attaching page_images=%d", iteration + 1,
+                   sum(p.get("type") == "image_url" for p in page_images))
         if page_images:
             messages.append(HumanMessage(content=[{
-                "type": "text", "text": "These are the cited PDF pages from the retrieved sources. "
-                "Read the images for scanned text, tables, and exact field values. "
-                "Cite the document and page; do not infer missing figures.",
+                "type": "text", "text": RETRIEVED_IMAGE_PROMPT,
             }, *page_images]))
 
     # Safety: if max iterations hit, ask for a final answer with what we have
-    messages.append(HumanMessage(content="Please provide your final answer based on the context retrieved so far."))
-    final = llm_tools.invoke(messages)
-    return final.content
+    trace.warning("retrieval round limit reached; requesting a supported partial/final answer")
+    messages.append(HumanMessage(content=FINAL_ANSWER_PROMPT))
+    final = trace.model_call(llm_tools, messages, "final")
+    if final.tool_calls:
+        trace.warning("final response requested more tools after the round limit")
+    return trace.finish(final.content)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
-# if __name__ == "__main__":
-#     print("Loading stores and model...")
-#     llm_tools, tool_map = build_agent()
-#     print("✓ Tax RAG agent ready. Type 'quit' to exit.\n")
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="Query personal tax documents with agent diagnostics.")
+    parser.add_argument("--debug", action="store_true", help="Enable debug-level diagnostics.")
+    parser.add_argument("--log-file", help="Also write timestamped diagnostics to this file.")
+    parser.add_argument("--trace-content", action="store_true", help="Include bounded previews of model text, tool arguments and retrieved text (may contain personal data).")
+    parser.add_argument("--no-stream", action="store_true", help="Use blocking model calls with heartbeat logs instead of streaming progress.")
+    parser.add_argument("--heartbeat-seconds", type=float, default=10, help="Seconds between waiting messages (default: 10).")
+    args = parser.parse_args(argv)
+    if args.heartbeat_seconds <= 0:
+        parser.error("--heartbeat-seconds must be positive")
+    return args
 
-#     while True:
-#         query = input("Your question: ").strip()
-#         if query.lower() in {"quit", "exit"}:
-#             break
-#         if not query:
-#             continue
 
-#         print("\nThinking...\n")
-#         answer = run_query(llm_tools, tool_map, query, verbose=True)
-#         print(f"\nAnswer:\n{answer}\n")
-#         print("-" * 60)
 if __name__ == "__main__":
-    print("Loading stores and model...")
+    args = parse_args()
+    configure_logging(debug=args.debug, log_file=args.log_file)
+    print("Loading stores and model...", flush=True)
     try:
         llm_tools, tool_map = build_agent()
     except FileNotFoundError as e:
@@ -307,6 +224,8 @@ if __name__ == "__main__":
             break
 
         print()
-        answer = run_query(llm_tools, tool_map, query, verbose=True)
+        answer = run_query(llm_tools, tool_map, query, verbose=True,
+                           trace_content=args.trace_content, stream=not args.no_stream,
+                           heartbeat_seconds=args.heartbeat_seconds)
         print(f"\nAnswer:\n{answer}\n")
         print("-" * 60)

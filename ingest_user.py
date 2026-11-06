@@ -1,33 +1,33 @@
 # ingest_user.py
-# Intelligence-first PDF ingestion pipeline.
-# Analyzes each PDF's structure before choosing an extraction strategy.
+# Structured PDF ingestion through the local Gemma vision service.
 
 import hashlib
-import io
+import json
+import argparse
 import shutil
-from llm_client import create_embeddings
+from llm_client import create_embeddings, embed_document_batches
 from pathlib import Path
 from dataclasses import dataclass
 from enum import Enum
 
-import fitz
+import pymupdf as fitz
 from langchain_core.documents import Document
 from langchain_chroma import Chroma
-from embedding_chunks import chunk_documents, load_embedding_config
+from embedding_chunks import chunk_documents, load_embedding_config, clear_tokenizer_cache
 from pdf_multimodal import (attach_pdf_images, discover_pdfs, prepare_pdf_images, store_pdf_images)
-from pdf_multimodal import load_pdf_config, page_text
+from pdf_multimodal import page_text
+from pdf_vision import PDFVisionExtractor, atomic_json
 
 # ── Config ────────────────────────────────────────────────────────────────────
 PDF_DIR         = "./data/user"
 STORE_DIR       = "./chroma_user_docs"
 COLLECTION_NAME = "user_docs"
 BATCH_SIZE      = load_embedding_config(purpose="ingestion")["batch_size"]
+PARALLEL_REQUESTS = load_embedding_config(purpose="ingestion")["parallel_requests"]
 CLEAR_ON_START  = True
 
-MIN_NATIVE_CHARS     = 50     # chars/page below this = needs OCR
+MIN_NATIVE_CHARS     = 50     # native-text classification only
 IMAGE_COVERAGE_RATIO = 0.4    # if images cover >40% of page area = likely scanned
-DPI_FORM             = 300    # high DPI for precise form OCR
-DPI_GENERAL          = 150    # lower DPI for general scanned docs
 
 # Keywords that strongly indicate a structured tax form
 TAX_FORM_MARKERS = [
@@ -42,10 +42,10 @@ TAX_FORM_MARKERS = [
 
 
 class ExtractionStrategy(Enum):
-    NATIVE         = "native"          # pure text PDF, extract directly
-    GENERAL_OCR    = "general_ocr"     # scanned doc, basic OCR
-    SPATIAL_OCR    = "spatial_ocr"     # structured tax form, spatial OCR
-    MIXED          = "mixed"           # some pages native, some OCR
+    NATIVE         = "native"          # native text layout
+    SCANNED    = "scanned"     # scanned layout
+    FORM    = "form"     # structured tax form layout
+    MIXED          = "mixed"           # mixed native and scanned layout
 
 
 @dataclass
@@ -66,7 +66,7 @@ class DocumentProfile:
 def analyze_pdf(pdf_path: Path) -> DocumentProfile:
     """
     Inspect PDF structure and return a DocumentProfile with the
-    recommended extraction strategy and the reasoning behind it.
+    layout classification for chunking; every page uses vision extraction.
     """
     pdf = fitz.open(str(pdf_path))
     page_count = len(pdf)
@@ -102,30 +102,18 @@ def analyze_pdf(pdf_path: Path) -> DocumentProfile:
     # Widgets are inspected on the actual pages; pdf_trailer() is not a dict.
 
     # ── Signal 3: Tax form keyword detection ─────────────────────────────────
-    # Scan native text sample; if too little native text, do a quick low-res
-    # OCR on the first page only to get enough text for keyword matching
+    # Classify from native text and filename; extraction itself never uses OCR.
     full_sample = " ".join(sample_text).lower()
-
-    if len(full_sample) < 100 and page_count > 0:
-        # First page low-res OCR just for classification
-        ocr_engine = get_ocr_engine()
-        if ocr_engine:
-            page_bytes = render_page(pdf[0], dpi=100)
-            try:
-                result, _ = ocr_engine(page_bytes)
-                if result:
-                    full_sample = " ".join(r[1] for r in result).lower()
-            except Exception:
-                pass
+    filename_form = any(marker in pdf_path.name.lower() for marker in ("w-2", "w2", "1099", "1098", "1040", "k-1"))
 
     tax_markers_found = [m for m in TAX_FORM_MARKERS if m in full_sample]
-    is_tax_form = len(tax_markers_found) >= 2 or has_form_fields
+    is_tax_form = len(tax_markers_found) >= 2 or has_form_fields or filename_form
 
     pdf.close()
 
     # ── Decision logic ────────────────────────────────────────────────────────
     if is_tax_form:
-        strategy   = ExtractionStrategy.SPATIAL_OCR
+        strategy   = ExtractionStrategy.FORM
         confidence = "high" if len(tax_markers_found) >= 3 or has_form_fields else "medium"
         reason     = (
             f"Tax form detected: {len(tax_markers_found)} marker(s) found "
@@ -139,7 +127,7 @@ def analyze_pdf(pdf_path: Path) -> DocumentProfile:
         reason     = f"Native text PDF: {native_ratio:.0%} of pages have sufficient text"
 
     elif native_ratio <= 0.1:
-        strategy   = ExtractionStrategy.GENERAL_OCR
+        strategy   = ExtractionStrategy.SCANNED
         confidence = "high"
         reason     = f"Fully scanned PDF: only {native_ratio:.0%} native text pages"
 
@@ -164,163 +152,62 @@ def analyze_pdf(pdf_path: Path) -> DocumentProfile:
     )
 
 
-# ── OCR helpers ───────────────────────────────────────────────────────────────
-
-def get_ocr_engine():
-    # Page images provide visual evidence even when no OCR is installed.
-    if not load_pdf_config()["ocr_enabled"]:
-        return None
-    try:
-        from rapidocr_onnxruntime import RapidOCR
-        return RapidOCR()
-    except ImportError:
-        return None
-
-
-def render_page(page: fitz.Page, dpi: int) -> bytes:
-    zoom = dpi / 72
-    mat = fitz.Matrix(zoom, zoom)
-    pix = page.get_pixmap(matrix=mat, colorspace=fitz.csRGB)
-    return pix.tobytes("png")
-
-
-def ocr_basic(page_bytes: bytes, ocr_engine) -> str:
-    from PIL import Image
-    img = Image.open(io.BytesIO(page_bytes))
-    result, _ = ocr_engine(img)
-    if not result:
-        return ""
-    return "\n".join(line[1] for line in result)
+def triage_pdf(profile: DocumentProfile, extractor) -> list[dict]:
+    decisions = []
+    with fitz.open(str(profile.path)) as pdf:
+        if pdf.needs_pass:
+            raise ValueError(f"PDF requires a password: {profile.path.name}")
+        for number, page in enumerate(pdf, 1):
+            try:
+                decision = extractor.triage_page(page)
+            except Exception as error:
+                raise RuntimeError(f"Triage {profile.path.name}, page {number}: {error}") from error
+            decisions.append(decision)
+            print(f"    → Page {number}/{len(pdf)}: {decision['action']} — {decision['reason']}")
+    identity = hashlib.sha256(profile.path.read_bytes()).hexdigest()
+    source = profile.path.resolve().relative_to(Path(PDF_DIR).resolve()).as_posix()
+    report_id = hashlib.sha256((source + identity).encode()).hexdigest()
+    atomic_json(Path(extractor.settings["cache_directory"]) / "reports" / (report_id + ".json"), {
+        "source_file": source, "source_sha256": identity,
+        "model": extractor.settings["model"],
+        "pages": [{"page": i+1, **decision} for i, decision in enumerate(decisions)],
+    })
+    return decisions
 
 
-def ocr_spatial(page_bytes: bytes, ocr_engine) -> str:
-    from PIL import Image
-    img = Image.open(io.BytesIO(page_bytes))
-    result, _ = ocr_engine(img)
-    if not result:
-        return ""
-
-    blocks = [{"text": r[1], "x": r[0][0][0], "y": r[0][0][1]} for r in result]
-    blocks.sort(key=lambda b: (round(b["y"] / 15) * 15, b["x"]))
-
-    lines, current_line, current_y = [], [], blocks[0]["y"]
-    for block in blocks:
-        if abs(block["y"] - current_y) <= 15:
-            current_line.append(block["text"])
-        else:
-            if current_line:
-                lines.append("  ".join(current_line))
-            current_line = [block["text"]]
-            current_y = block["y"]
-    if current_line:
-        lines.append("  ".join(current_line))
-    return "\n".join(lines)
-
-
-def tesseract_fallback(page_bytes: bytes) -> str:
-    if not load_pdf_config()["ocr_enabled"]:
-        return ""
-    try:
-        import pytesseract
-        from PIL import Image
-        return pytesseract.image_to_string(Image.open(io.BytesIO(page_bytes)))
-    except ImportError:
-        return ""
-
-
-# ── Per-page extraction ───────────────────────────────────────────────────────
-
-def extract_page(
-    page: fitz.Page,
-    profile: DocumentProfile,
-    ocr_engine,
-    tables_by_page: dict
-) -> tuple[str, str]:
-    """Route each page to the right extraction method based on its profile."""
-
-    if profile.strategy == ExtractionStrategy.SPATIAL_OCR:
-        native = page_text(page)
-        if len(native) >= MIN_NATIVE_CHARS or profile.has_form_fields:
-            text, method = native, "native_form"
-        else:
-            page_bytes = render_page(page, DPI_FORM)
-            text = ocr_spatial(page_bytes, ocr_engine) if ocr_engine else tesseract_fallback(page_bytes)
-            method = "spatial_ocr"
-
-    elif profile.strategy == ExtractionStrategy.NATIVE:
-        text = page_text(page)
-        method = "native"
-
-    elif profile.strategy in {ExtractionStrategy.GENERAL_OCR, ExtractionStrategy.MIXED}:
-        native_text = page_text(page)
-        if len(native_text) >= MIN_NATIVE_CHARS:
-            text, method = native_text, "native"
-        else:
-            page_bytes = render_page(page, DPI_GENERAL)
-            text = ocr_basic(page_bytes, ocr_engine) if ocr_engine else tesseract_fallback(page_bytes)
-            method = "ocr"
-    else:
-        text = page_text(page)
-        method = "native"
-
-    # Append table markdown if available
-    if page.number in tables_by_page:
-        table_md = tables_by_page[page.number]
-        if table_md.strip() not in text:
-            text = text + "\n\n" + table_md
-
-    return text, method
-
-
-def extract_tables(pdf_path: str) -> dict[int, str]:
-    try:
-        import pymupdf4llm
-        result = {}
-        for page_data in pymupdf4llm.to_markdown(pdf_path, page_chunks=True):
-            page_num = page_data.get("metadata", {}).get("page", -1)
-            text = page_data.get("text", "")
-            if "|" in text:
-                result[page_num] = text
-        return result
-    except Exception:
-        return {}
-
-
-# ── PDF processor ─────────────────────────────────────────────────────────────
-
-def process_pdf(profile: DocumentProfile, ocr_engine) -> list[Document]:
-    pdf = fitz.open(str(profile.path))
-    tables_by_page = extract_tables(str(profile.path))
-    method_counts: dict[str, int] = {}
+# Omitted decisions retain the original full-page extraction API for callers.
+def process_pdf(profile: DocumentProfile, extractor, decisions=None) -> list[Document]:
     docs = []
-
-    for page_num in range(len(pdf)):
-        page = pdf[page_num]
-        text, method = extract_page(page, profile, ocr_engine, tables_by_page)
-        method_counts[method] = method_counts.get(method, 0) + 1
-
-        if not text.strip():
-            continue
-
-        docs.append(Document(
-            page_content=text,
-            metadata={
-                "source_file":       profile.path.resolve().relative_to(Path(PDF_DIR).resolve()).as_posix(),
-                "source_pdf_path": str(profile.path.resolve()),
-                "source_type":       "user",
-                "document_type":     "tax_form" if profile.is_tax_form else "general",
-                "strategy":          profile.strategy.value,
-                "page":              page_num + 1,
-                "total_pages":       profile.page_count,
-                "extraction_method": method,
-                "has_tables":        page_num in tables_by_page,
-                "detection_confidence": profile.confidence,
-            }
-        ))
-
-    pdf.close()
-    counts_str = " | ".join(f"{v} {k}" for k, v in method_counts.items() if v > 0)
-    print(f"    → {len(docs)} pages ({counts_str})")
+    with fitz.open(str(profile.path)) as pdf:
+        if pdf.needs_pass:
+            raise ValueError(f"PDF requires a password: {profile.path.name}")
+        if decisions is not None and len(decisions) != len(pdf):
+            raise ValueError("Triage page count does not match PDF")
+        for page_num, page in enumerate(pdf):
+            decision = decisions[page_num] if decisions is not None else None
+            if decision is not None and decision["action"] == "skip":
+                print(f"    → Skipped page {page_num + 1}: {decision['reason']}")
+                continue
+            try:
+                text = (extractor.extract_selected(page, decision) if decision is not None
+                        else extractor.extract_page(page))
+            except Exception as error:
+                raise RuntimeError(f"{profile.path.name}, page {page_num + 1}: {error}") from error
+            fields = [f"{w.field_name}: {w.field_value}" for w in page.widgets() or []
+                      if w.field_value not in (None, "", "Off")]
+            if fields:
+                text += "\n\nCanonical PDF form fields:\n" + "\n".join(fields)
+            docs.append(Document(page_content=text, metadata={
+                "source_file": profile.path.resolve().relative_to(Path(PDF_DIR).resolve()).as_posix(),
+                "source_pdf_path": str(profile.path.resolve()), "source_type": "user",
+                "document_type": "tax_form" if profile.is_tax_form else "general",
+                "strategy": "vision", "page": page_num + 1, "total_pages": len(pdf),
+                "extraction_method": "gemma_vision", "extraction_model": extractor.settings["model"],
+                "has_tables": "|" in text, "detection_confidence": profile.confidence,
+                **({"triage_action": decision["action"], "triage_reason": decision["reason"],
+                    "selected_regions": json.dumps(decision["regions"])} if decision is not None else {}),
+            }))
+            print(f"    → Transcribed page {page_num + 1}/{len(pdf)}")
     return docs
 
 
@@ -337,16 +224,19 @@ def batch(lst: list, size: int):
 
 # ── Main ingest ───────────────────────────────────────────────────────────────
 
-def ingest():
+def ingest(*, fresh=False):
     pdf_files = discover_pdfs(PDF_DIR)
     if not pdf_files:
         print(f"No PDF files found in {PDF_DIR}")
         return
 
+    if fresh:
+        clear_tokenizer_cache()
+        print("Fresh run: bypassing triage/extraction caches and rebuilding the user store.")
+
     print(f"Found {len(pdf_files)} PDF(s) — analyzing structure...\n")
 
     # Analyze all PDFs first — print a summary table before any extraction
-    ocr_engine = get_ocr_engine()
     profiles: list[DocumentProfile] = []
 
     for pdf_path in pdf_files:
@@ -356,7 +246,7 @@ def ingest():
         tag = "⚠ low confidence" if profile.confidence == "low" else ""
         print(
             f"  {profile.path.name}\n"
-            f"    Strategy:  {profile.strategy.value} ({profile.confidence} confidence) {tag}\n"
+            f"    Extraction: Gemma vision; layout profile: {profile.strategy.value} ({profile.confidence} confidence) {tag}\n"
             f"    Reason:    {profile.reason}\n"
             f"    Pages:     {profile.page_count} | "
             f"Native: {profile.native_page_ratio:.0%} | "
@@ -368,18 +258,36 @@ def ingest():
         strategy_counts[p.strategy.value] = strategy_counts.get(p.strategy.value, 0) + 1
     print("Strategy summary: " + " | ".join(f"{v}x {k}" for k, v in strategy_counts.items()) + "\n")
 
-    # Extract text using the detected strategy per PDF
-    all_page_docs: list[Document] = []
+    # Phase 1 is eager: finish every image-embedding request before Gemma loads.
+    print("Phase 1/3: Embedding all PDF page images with EmbeddingGemma 2...")
+    visual_pages = prepare_pdf_images(pdf_files, PDF_DIR)
+    print(f"Completed image embedding for {len(visual_pages)} pages.")
+
+    # Phase 2 never invokes the embedding model, including its tokenizer.
+    print("Phase 2a/3: Triaging all PDF pages with Gemma...")
+    extractor = PDFVisionExtractor(use_cache=not fresh)
+    decisions_by_pdf = []
     for profile in profiles:
+        print(f"  Triaging: {profile.path.name}")
+        decisions_by_pdf.append(triage_pdf(profile, extractor))
+    triage_counts = {}
+    for decisions in decisions_by_pdf:
+        for decision in decisions:
+            action = decision["action"]
+            triage_counts[action] = triage_counts.get(action, 0) + 1
+    print("Triage summary: " + " | ".join(f"{count} {action}" for action, count in triage_counts.items()))
+    print("Phase 2b/3: Extracting selected content with Gemma...")
+    all_page_docs: list[Document] = []
+    for profile, decisions in zip(profiles, decisions_by_pdf):
         print(f"  Extracting: {profile.path.name} [{profile.strategy.value}]")
-        all_page_docs.extend(process_pdf(profile, ocr_engine))
+        all_page_docs.extend(process_pdf(profile, extractor, decisions))
 
     print(f"\nTotal pages extracted: {len(all_page_docs)}")
 
     # Keep short forms intact; split long forms with identifying context.
     # General documents use 384-token passages with 48-token overlap.
-    print("Embedding PDF page images with EmbeddingGemma 2...")
-    visual_pages = prepare_pdf_images(pdf_files, PDF_DIR)
+    # Phase 3 needs Gemma output; return to the embedding model only once.
+    print("Phase 3/3: Tokenizing and embedding all extracted text...")
     attach_pdf_images(all_page_docs, visual_pages)
     all_chunks = chunk_documents(all_page_docs)
     print(f"Token-bounded chunks: {len(all_chunks)}\n")
@@ -392,7 +300,7 @@ def ingest():
             chunk.page_content
         )
 
-    if CLEAR_ON_START and Path(STORE_DIR).exists():
+    if (CLEAR_ON_START or fresh) and Path(STORE_DIR).exists():
         shutil.rmtree(STORE_DIR)
         print("Cleared previous user store\n")
 
@@ -418,9 +326,16 @@ def ingest():
 
     print(f"Embedding {len(new_chunks)} chunks in batches of {BATCH_SIZE}...\n")
     total_added = 0
-    for doc_batch in batch(new_chunks, BATCH_SIZE):
+    for doc_batch, vectors in embed_document_batches(
+        embeddings, batch(new_chunks, BATCH_SIZE), max_workers=PARALLEL_REQUESTS
+    ):
         ids = [d.metadata["doc_id"] for d in doc_batch]
-        store.add_documents(documents=doc_batch, ids=ids)
+        store._collection.upsert(
+            ids=ids,
+            embeddings=vectors,
+            documents=[d.page_content for d in doc_batch],
+            metadatas=[d.metadata for d in doc_batch],
+        )
         total_added += len(doc_batch)
         print(f"  → Progress: {total_added}/{len(new_chunks)}", end="\r")
 
@@ -428,5 +343,12 @@ def ingest():
     print(f"✓ Ingestion complete — {total_added} chunks added to {STORE_DIR}")
 
 
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="Ingest personal PDF documents.")
+    parser.add_argument("--fresh", "--no-cache", dest="fresh", action="store_true",
+                        help="Bypass saved triage/extraction results and rebuild the user vector store.")
+    return parser.parse_args(argv)
+
+
 if __name__ == "__main__":
-    ingest()
+    ingest(fresh=parse_args().fresh)

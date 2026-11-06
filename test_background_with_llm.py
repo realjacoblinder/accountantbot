@@ -1,3 +1,4 @@
+from query_prompts import TAX_RAG_SYSTEM_PROMPT
 # test_background_query.py
 from pathlib import Path
 from llm_client import create_chat_model, load_llm_config, create_embeddings
@@ -72,18 +73,10 @@ def build_rag_chain(store: Chroma):
 
     llm = create_chat_model()
 
-    prompt = ChatPromptTemplate.from_template("""
-    You are a US tax law assistant. Answer the question using only the provided
-    tax code excerpts. Cite the specific USC section (e.g. "26 U.S.C. § 1(a)")
-    when referencing a rule. If the context does not contain enough information
-    to answer, say so clearly — do not guess.
-
-    Tax Code Context:
-    {context}
-
-    Question: {question}
-
-    Answer:""")
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", TAX_RAG_SYSTEM_PROMPT),
+        ("human", "Question: {question}\n\nRetrieved tax-code evidence:\n{context}"),
+    ])
 
     def format_docs(docs):
         sections = []

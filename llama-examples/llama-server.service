@@ -1,0 +1,21 @@
+[Unit]
+Description=llama.cpp - Multi-Model LLM Server
+
+[Service]
+Type=simple
+
+WorkingDirectory=%h/llama.cpp
+Environment=LLAMA_CACHE=%h/.cache/llama-server-presets
+
+ExecStart=%h/llama.cpp/build/bin/llama-server \
+    --models-preset %h/llama.cpp/models.ini \
+    --models-max 1 \
+    --models-autoload \
+    --host 127.0.0.1 \
+    --port 8080
+
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

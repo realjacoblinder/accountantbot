@@ -3,17 +3,19 @@
 # using the configured embedding model. Safe to re-run — skips already-embedded chunks.
 
 import json
-from llm_client import create_embeddings
+import argparse
+from llm_client import create_embeddings, embed_document_batches
 from pathlib import Path
 from langchain_core.documents import Document
 from langchain_chroma import Chroma
-from embedding_chunks import chunk_documents, load_embedding_config
+from embedding_chunks import chunk_documents, load_embedding_config, clear_tokenizer_cache
 
 # ── Config ────────────────────────────────────────────────────────────────────
 JSONL_FILE      = "./data/background/chunks.jsonl"  # path to your .jsonl file
 STORE_DIR       = "./chroma_tax_code"
 COLLECTION_NAME = "tax_code"
 BATCH_SIZE      = load_embedding_config(purpose="ingestion")["batch_size"]
+PARALLEL_REQUESTS = load_embedding_config(purpose="ingestion")["parallel_requests"]
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -67,11 +69,15 @@ def batch(lst: list, size: int):
         yield lst[i : i + size]
 
 
-def ingest():
+def ingest(*, fresh=False):
     jsonl_path = Path(JSONL_FILE)
     if not jsonl_path.exists():
         print(f"✗ File not found: {JSONL_FILE}")
         return
+
+    if fresh:
+        clear_tokenizer_cache()
+        print("Fresh run: rebuilding the tax-code collection from source.")
 
     print(f"Loading {jsonl_path.name}...")
     records = load_jsonl(jsonl_path)
@@ -80,6 +86,10 @@ def ingest():
     docs = records_to_documents(records)
     print(f"  → {len(docs)} valid documents built")
 
+    if not docs:
+        print("No valid source documents; existing store left intact.")
+        return
+
     embeddings = create_embeddings(purpose="ingestion")
     store = Chroma(
         collection_name=COLLECTION_NAME,
@@ -87,7 +97,11 @@ def ingest():
         embedding_function=embeddings
     )
 
-    existing_ids = get_existing_ids(store)
+    if fresh:
+        store.reset_collection()
+        existing_ids = set()
+    else:
+        existing_ids = get_existing_ids(store)
     print(f"  → {len(existing_ids)} chunks already in store (will skip)\n")
 
     new_docs = [d for d in docs if d.metadata["doc_id"] not in existing_ids]
@@ -98,9 +112,16 @@ def ingest():
     print(f"Embedding {len(new_docs)} new chunks in batches of {BATCH_SIZE}...\n")
 
     total_added = 0
-    for doc_batch in batch(new_docs, BATCH_SIZE):
+    for doc_batch, vectors in embed_document_batches(
+        embeddings, batch(new_docs, BATCH_SIZE), max_workers=PARALLEL_REQUESTS
+    ):
         ids = [d.metadata["doc_id"] for d in doc_batch]
-        store.add_documents(documents=doc_batch, ids=ids)
+        store._collection.upsert(
+            ids=ids,
+            embeddings=vectors,
+            documents=[d.page_content for d in doc_batch],
+            metadatas=[d.metadata for d in doc_batch],
+        )
         total_added += len(doc_batch)
         print(f"  → Progress: {total_added}/{len(new_docs)}", end="\r")
 
@@ -111,5 +132,12 @@ def ingest():
     print(f"  Store:   {STORE_DIR}")
 
 
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="Ingest tax-code JSONL documents.")
+    parser.add_argument("--fresh", "--no-cache", dest="fresh", action="store_true",
+                        help="Rebuild the tax-code collection from source instead of skipping existing IDs.")
+    return parser.parse_args(argv)
+
+
 if __name__ == "__main__":
-    ingest()
+    ingest(fresh=parse_args().fresh)

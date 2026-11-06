@@ -9,6 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from query_prompts import RETRIEVED_IMAGE_PROMPT, FINAL_ANSWER_PROMPT
 from embedding_chunks import DEFAULTS
 from pdf_multimodal import (
     PDFImageEmbedder, attach_pdf_images, discover_pdfs, page_text,
@@ -184,7 +185,9 @@ class RetrievalTests(unittest.TestCase):
             {'type': 'image_url', 'image_url': {'url': 'data:image/png;base64,AA=='}}]),
                  'tax': SimpleNamespace(invoke=lambda args: 'statute')}
         scope = {'HumanMessage': Human, 'ToolMessage': Tool, 'SystemMessage': Message,
-                 'SYSTEM_PROMPT': 'instructions', 'MAX_ITERATIONS': 5}
+                 'SYSTEM_PROMPT': 'instructions', 'MAX_ITERATIONS': 5,
+                 'RETRIEVED_IMAGE_PROMPT': RETRIEVED_IMAGE_PROMPT,
+                 'FINAL_ANSWER_PROMPT': FINAL_ANSWER_PROMPT}
         exec(compile(ast.Module(body=[function], type_ignores=[]), '<agent-loop>', 'exec'), scope)
         self.assertEqual(scope['run_query'](model, tools, 'question', verbose=False), 'answer')
         messages = snapshots[-1]

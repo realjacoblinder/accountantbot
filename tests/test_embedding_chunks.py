@@ -120,6 +120,31 @@ class ChunkTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 load_embedding_config(path, purpose='typo')
 
+    def test_query_endpoint_override_does_not_change_ingestion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'llm.conf'
+            path.write_text(json.dumps({'embeddings': {
+                'api_base': 'http://localhost:8080',
+                'query_api_base': 'http://localhost:8081',
+            }}))
+            query = load_embedding_config(path)
+            ingestion = load_embedding_config(path, purpose='ingestion')
+            self.assertEqual(query['api_base'], 'http://localhost:8081/v1')
+            self.assertEqual(ingestion['api_base'], 'http://localhost:8080/v1')
+            self.assertEqual(query['model'], 'embeddinggemma-2-F16')
+            self.assertEqual(ingestion['model'], 'embeddinggemma-2-gpu')
+
+    def test_clients_and_tokenizers_use_their_purpose_endpoint(self):
+        import llm_client
+        for purpose, port in [('query', 8081), ('ingestion', 8080)]:
+            with self.subTest(purpose=purpose), \
+                 patch('llm_client.OpenAIEmbeddings') as client, \
+                 patch('llm_client.get_tokenizer') as tokenizer:
+                llm_client.create_embeddings(purpose=purpose)
+                expected = f'http://127.0.0.1:{port}/v1'
+                self.assertEqual(client.call_args.kwargs['base_url'], expected)
+                self.assertEqual(tokenizer.call_args.args[0]['api_base'], expected)
+
     def test_chunking_uses_ingestion_tokenizer(self):
         with patch('embedding_chunks.get_tokenizer', return_value=self.tokenizer) as tokenizer:
             chunk_documents([Document('A short passage')])

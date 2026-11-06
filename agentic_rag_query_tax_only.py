@@ -1,4 +1,6 @@
 from pathlib import Path
+from query_prompts import TAX_ONLY_SYSTEM_PROMPT, FINAL_ANSWER_PROMPT
+from retrieval_content import source_text
 from llm_client import create_chat_model, create_embeddings
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
@@ -13,31 +15,7 @@ from custom_langchain import HybridEnsembleRetriever
 BACKGROUND_STORE = "./chroma_tax_code"
 MAX_ITERATIONS   = 5
 
-SYSTEM_PROMPT = """You are an expert US tax assistant with access to a retrieval tool:
-
-- `search_tax_code`: searches the full US tax code (Title 26 USC) for laws, rules, brackets, and definitions
-
-## How to Answer
-
-1. **Search the tax code** to find the relevant statute, bracket, deduction rule, or definition needed to answer the user's question.
-2. **Call the tool multiple times** when needed — for example, if a deduction rule cross-references another section, look that up too before answering.
-3. **Only give a final answer once you have enough retrieved context.** 4. **Cite every rule** with its specific USC section (e.g. "26 U.S.C. § 1(a)", "26 U.S.C. § 162(a)", "26 U.S.C. § 199A").
-5. **Never fabricate numbers, brackets, or rules.** If the retrieved context doesn't contain the answer, say so rather than guessing.
-6. **Show your work** for any tax calculations or logic paths — list each rule applied and explain the step-by-step reasoning.
-
-## Example Reasoning Pattern
-
-User asks: *"What is the standard deduction for a married couple filing jointly in 2024?"*
-
-1. Call `search_tax_code("standard deduction 2024 married filing jointly")`
-2. Evaluate retrieved text for the specific figure and statute.
-3. Present the answer clearly, citing the relevant code section.
-
-## Tone and Format
-
-- Be precise and factual.
-- Flag anything that could trigger an audit or requires professional review.
-- For extremely complex situations (e.g., corporate restructuring, complex trusts), note that a CPA or tax attorney review is advisable."""
+SYSTEM_PROMPT = TAX_ONLY_SYSTEM_PROMPT
 
 
 def build_tools(background_store: Chroma):
@@ -62,13 +40,12 @@ def build_tools(background_store: Chroma):
     def format_docs(docs: List[Document]) -> str:
         out = []
         for d in docs:
-            source = d.metadata.get("filename", "unknown")
-            out.append(f"[SOURCE: {source}]\n{d.page_content}")
+            out.append(source_text(d))
         return "\n\n---\n\n".join(out) if out else "No results found."
 
     @tool
     def search_tax_code(query: str) -> str:
-        """Search the US tax code for laws, rules, brackets, and definitions."""
+        """Retrieve ranked Title 26 excerpts; annual IRS guidance may be unavailable."""
         docs = hybrid_background.invoke(query)
         return format_docs(docs)
 
@@ -140,7 +117,7 @@ def run_query(llm_tools, tool_map: dict, question: str, verbose: bool = True) ->
             ))
 
     # Safety: if max iterations hit, ask for a final answer with what we have
-    messages.append(HumanMessage(content="Please provide your final answer based on the context retrieved so far."))
+    messages.append(HumanMessage(content=FINAL_ANSWER_PROMPT))
     final = llm_tools.invoke(messages)
     return final.content
 

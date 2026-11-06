@@ -19,6 +19,7 @@ DEFAULTS = {
     "api_key": "llama.cpp",
     "timeout": 600,
     "batch_size": 32,
+    "parallel_requests": 4,
     "max_input_tokens": 2048,
     "tax_code_chunk_tokens": 512,
     "tax_code_overlap_tokens": 64,
@@ -42,10 +43,13 @@ def load_embedding_config(config_path=None, *, purpose="query"):
         settings.update(config.get("embeddings", {}))
     if purpose == "ingestion":
         settings["model"] = settings["ingestion_model"]
+    else:
+        # Query CPU service is independent of the ingestion/router backend.
+        settings["api_base"] = settings.get("query_api_base", settings["api_base"])
     settings["api_base"] = settings["api_base"].rstrip("/")
     if not settings["api_base"].endswith("/v1"):
         settings["api_base"] += "/v1"
-    for key in ("batch_size", "max_input_tokens"):
+    for key in ("batch_size", "parallel_requests", "max_input_tokens"):
         if type(settings[key]) is not int or settings[key] <= 0:
             raise ValueError(f"embeddings.{key} must be a positive integer")
     for kind in ("tax_code", "general", "form"):
@@ -98,6 +102,12 @@ class LlamaTokenizer:
 @lru_cache(maxsize=8)
 def _tokenizer(api_base, model, api_key, timeout):
     return LlamaTokenizer(api_base, model, api_key, timeout)
+
+
+def clear_tokenizer_cache():
+    """Clear process-local token counts and tokenizer instances for a fresh run."""
+    LlamaTokenizer.count.cache_clear()
+    _tokenizer.cache_clear()
 
 
 def get_tokenizer(settings=None):

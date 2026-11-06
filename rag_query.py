@@ -1,4 +1,5 @@
 # rag_query.py
+from query_prompts import RAG_SYSTEM_PROMPT
 from langchain_chroma import Chroma
 from langchain_community.retrievers import BM25Retriever
 from langchain_core.documents import Document
@@ -51,15 +52,7 @@ def build_chain():
 
     llm = create_chat_model()
 
-    instructions = """
-You are a tax assistant. Follow these rules strictly:
-1. Base your answer on the user's specific documents first.
-2. Cite relevant tax code sections or specific user documents (e.g., W-2, 1099) used.
-3. If the context doesn't contain the answer, say so. Do not guess.
-
-4. Read attached PDF page images for scanned text, table layout, and field values.
-   Cite the document and page. Do not infer missing figures.
-"""
+    instructions = RAG_SYSTEM_PROMPT
 
     def prompt(values):
         return [

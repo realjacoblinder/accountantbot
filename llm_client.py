@@ -1,6 +1,8 @@
 """Shared LangChain chat and embedding clients for local llama.cpp servers."""
 
 import json
+from concurrent.futures import ThreadPoolExecutor
+from itertools import islice
 from pathlib import Path
 
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
@@ -14,6 +16,8 @@ DEFAULT_CONFIG = {
     "api_base": "http://127.0.0.1:8080/v1",
     "temperature": 0.1,
     "timeout": 600,
+    "max_tokens": 8192,
+    "reasoning_effort": "medium",
 }
 
 
@@ -35,6 +39,10 @@ def load_llm_config(config_path=None):
     """Read repo-local settings, retaining llama.cpp defaults if absent."""
     config = {**DEFAULT_CONFIG, **_read_config(config_path).get("llm", {})}
     config["api_base"] = _api_base(config["api_base"])
+    if type(config["max_tokens"]) is not int or config["max_tokens"] <= 0:
+        raise ValueError("llm.max_tokens must be a positive integer")
+    if not isinstance(config["reasoning_effort"], str) or not config["reasoning_effort"].strip():
+        raise ValueError("llm.reasoning_effort must be a non-empty string")
     return config
 
 
@@ -51,6 +59,8 @@ def create_chat_model(*, temperature=None):
         api_key=config.get("api_key", "llama.cpp"),
         temperature=config["temperature"] if temperature is None else temperature,
         timeout=config["timeout"],
+        max_tokens=config["max_tokens"],
+        reasoning_effort=config["reasoning_effort"],
         max_retries=0,
         use_responses_api=False,
         stream_usage=False,
@@ -96,3 +106,20 @@ def create_embeddings(*, purpose="query"):
         max_retries=0,
     )
     return EmbeddingGemmaEmbeddings(client, settings, get_tokenizer(settings))
+
+
+def embed_document_batches(embedding_function, document_batches, *, max_workers=4):
+    """Embed batches concurrently while yielding them in input order."""
+    if type(max_workers) is not int or max_workers <= 0:
+        raise ValueError("max_workers must be a positive integer")
+
+    batches = iter(document_batches)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        while group := list(islice(batches, max_workers)):
+            vectors = executor.map(
+                lambda docs: embedding_function.embed_documents(
+                    [document.page_content for document in docs]
+                ),
+                group,
+            )
+            yield from zip(group, vectors)

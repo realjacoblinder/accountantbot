@@ -8,6 +8,7 @@ import base64
 import hashlib
 import json
 import math
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.error import HTTPError
@@ -17,8 +18,8 @@ from embedding_chunks import CONFIG_PATH, load_embedding_config
 
 ROOT = Path(__file__).resolve().parent
 PDF_DEFAULTS = {"render_dpi": 150, "max_image_edge": 2000,
-                "image_directory": "data/user_page_images", "max_retrieved_pages": 4,
-                "ocr_enabled": False}
+                "image_directory": "data/user_page_images", "max_retrieved_pages": 4}
+PDF_IMAGE_EMBEDDING_WORKERS = 2
 
 
 def load_pdf_config():
@@ -111,13 +112,13 @@ class PageVector:
 
 
 def prepare_pdf_images(pdf_files, source_root, *, embedder=None, pdf_settings=None):
-    """Compute every page before callers clear/write the existing vector store."""
+    """Embed pages with at most two concurrent calls before changing the store."""
     import fitz
 
     embedder = embedder or PDFImageEmbedder()
     settings = pdf_settings or load_pdf_config()
     source_root = Path(source_root).resolve()
-    result = []
+    page_inputs = []
     for filename in pdf_files:
         path = Path(filename).resolve()
         source = path.relative_to(source_root).as_posix()
@@ -136,16 +137,26 @@ def prepare_pdf_images(pdf_files, source_root, *, embedder=None, pdf_settings=No
                                         alpha=False, annots=True)
                 image = directory / f"page-{index + 1:04d}.png"
                 pixmap.save(str(image))
-                vector, tokens = embedder.embed_page(image)
                 doc_id = f"pdf_image_{identity}_{index + 1}"
                 text = f"PDF page {index + 1} of {source}\n" + page_text(page)
-                result.append(PageVector(doc_id, text.strip(), {
+                metadata = {
                     "doc_id": doc_id, "source_file": source, "filename": source,
                     "source_pdf_path": str(path), "source_type": "user",
                     "page": index + 1, "total_pages": len(pdf),
                     "page_image_path": str(image.resolve()), "embedding_type": "page_image",
-                    "embedding_model": embedder.settings["model"], "token_count": tokens,
-                }, vector))
+                    "embedding_model": embedder.settings["model"],
+                }
+                # Rendering and PyMuPDF access stay on this thread. Only network
+                # embedding work runs concurrently, capped to two pages at once.
+                page_inputs.append((image, doc_id, text.strip(), metadata))
+
+    with ThreadPoolExecutor(max_workers=PDF_IMAGE_EMBEDDING_WORKERS) as executor:
+        embedded = list(executor.map(lambda item: embedder.embed_page(item[0]), page_inputs))
+
+    result = []
+    for (image, doc_id, text, metadata), (vector, tokens) in zip(page_inputs, embedded):
+        metadata["token_count"] = tokens
+        result.append(PageVector(doc_id, text, metadata, vector))
     return result
 
 
