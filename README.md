@@ -35,11 +35,11 @@ cmake --build build --config Release -j
 
 For CPU-only use, omit `-DGGML_CUDA=ON`. Follow the llama.cpp build instructions for other GPU backends. The service example expects the executable at `~/llama.cpp/build/bin/llama-server`.
 
-Place the model GGUFs and their matching projectors under `~/model-gguf/`, or edit the paths in the INI files. The configured aliases are:
+Place the model GGUFs and any required matching projectors under `~/model-gguf/`, or edit the paths in the INI files. `llm.conf` uses `qwen3.6-35B-A3B` for chat and agent queries. Add a preset exposing that exact alias to your server configuration with the appropriate Qwen GGUF and any required projector; the supplied GPU `models.ini` still contains the previous Gemma chat preset. The application aliases are:
 
 | Alias | Purpose | Configuration | Model |
 | --- | --- | --- | --- |
-| `gemma-4-26B-A4B` | Chat, agent queries, and multimodal answer context | GPU `models.ini` | [Gemma 4 26B A4B IT QAT](https://huggingface.co/unsloth/gemma-4-26B-A4B-it-qat-GGUF) |
+| `qwen3.6-35B-A3B` | Chat and agent queries | GPU service (add a matching preset) | Qwen3.6 35B A3B |
 | `gemma-4-E4B` | PDF page triage and transcription | GPU `models.ini` | [Gemma 4 E4B IT QAT](https://huggingface.co/unsloth/gemma-4-E4B-it-qat-GGUF) (Q4) |
 | `embeddinggemma-2-gpu` | Index building, tokenizer calls, and page-image embeddings | GPU `models.ini` | [EmbeddingGemma 2](https://huggingface.co/unsloth/embeddinggemma-2-GGUF) (FP16) |
 | `embeddinggemma-2-F16` | Query embeddings | CPU `cpu-models.ini` | Same EmbeddingGemma 2 weights and projector (FP16) |
@@ -62,7 +62,7 @@ Replace `/path/to/AccountantBot` with this checkout's location. To see startup l
 
 The unit references `%h/llama.cpp` and `%h/llama.cpp/models.ini`, so it assumes the clone and `models.ini` are in your home directory. Copy the example `models.ini` there, or edit the service unit paths. The configured CPU embedding endpoint in `llm.conf` is `http://127.0.0.1:8081/v1`; the provided unit starts only the GPU router on port 8080. To use the CPU query alias as configured, start a second llama-server service using `cpu-models.ini` on port 8081, with the CPU alias enabled, or change `query_api_base` to a compatible embedding endpoint. Keep the service loopback-only unless you have a deliberate network access and authentication setup.
 
-The server needs llama.cpp's OpenAI-compatible chat, embedding, and tokenization APIs. PDF flows additionally need the multimodal embedding extension and image-capable Gemma chat service. Adjust the service and model settings for the llama.cpp revision and backend you build; the API aliases must match `llm.conf` (`llm.model`, `embeddings.model`, `embeddings.ingestion_model`, and `pdf_extraction.model`).
+The server needs llama.cpp's OpenAI-compatible chat, embedding, and tokenization APIs. PDF flows additionally need the multimodal embedding extension and the image-capable Gemma E4B extraction service. To use retrieved page images in answers, the Qwen chat service must also support image input. Adjust the service and model settings for the llama.cpp revision and backend you build; the API aliases must match `llm.conf` (`llm.model`, `embeddings.model`, `embeddings.ingestion_model`, and `pdf_extraction.model`).
 
 ## Use the project
 
@@ -129,7 +129,7 @@ For a deliberate refresh that bypasses saved ingestion results, the main ingesti
 
 `llm.conf` is the central configuration for local model endpoints and processing options. The client code has local defaults, but configure the file to match the services you are running. Chat, text embeddings, and multimodal PDF processing may require different model capabilities.
 
-Query responses use `llm.max_tokens` (8,192) and request `llm.reasoning_effort` (`medium`), including tool-bound agent calls. The current Gemma 4 chat template advertises no distinct reasoning-effort levels, so it may ignore the requested level; the output token cap is independent. E4B extraction keeps its separate budgets and explicitly disables thinking.
+Chat and agent queries use `llm.model` (`qwen3.6-35B-A3B`). Query responses use `llm.max_tokens` (16,384) and request `llm.reasoning_effort` (`medium`), including tool-bound agent calls. Support for the requested reasoning level depends on the server and chat template; the output token cap is independent. Gemma E4B PDF extraction and EmbeddingGemma embedding settings are unchanged. E4B extraction keeps its separate budgets and explicitly disables thinking.
 
 Generated indexes, source documents, and extracted content are kept in local data directories and are excluded by `.gitignore`. Keep the original source files and their corresponding indexes together when moving a working dataset. Avoid committing personal tax documents, extracted transcriptions, model files, or credentials.
 
